@@ -1,4 +1,6 @@
 from pathlib import Path
+
+import PIL.Image
 from PIL import Image
 
 try:
@@ -37,6 +39,14 @@ video_mesh_fn = None
 model_holder = ModelHolder()
 
 
+def convert_to_i16(arr):
+    # Single channel, 16 bit image. This loses some precision!
+    # uint16 conversion uses round-down, therefore values should be [0; 2**16)
+    numbytes = 2
+    max_val = (2 ** (8 * numbytes))
+    out = np.clip(arr * max_val, 0, max_val - 0.1)  # -0.1 from above is needed to avoid overflowing
+    return out.astype("uint16")
+
 def convert_i16_to_rgb(image, like):
     # three channel, 8 bits per channel image
     output = np.zeros_like(like)
@@ -50,6 +60,10 @@ class CoreGenerationFunnelInp:
     """This class takes a dictionary and creates a core_generation_funnel inp.
     Non-applicable parameters are silently discarded (no error)"""
     def __init__(self, values):
+        if isinstance(values, CoreGenerationFunnelInp):
+            values = values.values
+        values = {(k.name if isinstance(k, GenerationOptions) else k).lower(): v for k, v in values.items()}
+
         self.values = {}
         for setting in GenerationOptions:
             name = setting.name.lower()
@@ -74,7 +88,7 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
     inp = CoreGenerationFunnelInp(inp)
 
     if ops is None:
-        ops = {}
+        ops = backbone.gather_ops()
     model_holder.update_settings(**ops)
 
     # TODO: ideally, run_depthmap should not save meshes - that makes the function not pure
@@ -129,15 +143,19 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
             out = None
             if inputdepthmaps is not None and inputdepthmaps[count] is not None:
                 # use custom depthmap
-                dimg = inputdepthmaps[count]
-                # resize if not same size as input
-                if dimg.width != inputimages[count].width or dimg.height != inputimages[count].height:
-                    dimg = dimg.resize((inputimages[count].width, inputimages[count].height), Image.Resampling.LANCZOS)
-
-                if dimg.mode == 'I' or dimg.mode == 'P' or dimg.mode == 'L':
-                    out = np.asarray(dimg, dtype="float")
+                dp = inputdepthmaps[count]
+                if isinstance(dp, Image.Image):
+                    if dp.width != inputimages[count].width or dp.height != inputimages[count].height:
+                        dp = dp.resize((inputimages[count].width, inputimages[count].height), Image.Resampling.LANCZOS)
+                    if dp.mode == 'I' or dp.mode == 'P' or dp.mode == 'L':
+                        out = np.asarray(dp, dtype="float")
+                    else:
+                        out = np.asarray(dp, dtype="float")[:, :, 0]
                 else:
-                    out = np.asarray(dimg, dtype="float")[:, :, 0]
+                    # Should be in interval [0; 1], values outside of this range will be clipped.
+                    out = np.asarray(dp, dtype="float")
+                    assert inputimages[count].height == out.shape[0], "Custom depthmap height mismatch"
+                    assert inputimages[count].width == out.shape[1], "Custom depthmap width mismatch"
             else:
                 # override net size (size may be different for different images)
                 if inp[go.NET_SIZE_MATCH]:
@@ -156,20 +174,17 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
                     # TODO: some models may output negative values, maybe these should be clamped to zero.
                     if raw_prediction_invert:
                         out *= -1
+                    if inp[go.DO_OUTPUT_DEPTH_PREDICTION]:
+                        yield count, 'depth_prediction', np.copy(out)
                     if inp[go.CLIPDEPTH]:
                         out = (out - out.min()) / (out.max() - out.min())  # normalize to [0; 1]
                         out = np.clip(out, inp[go.CLIPDEPTH_FAR], inp[go.CLIPDEPTH_NEAR])
+                    out = (out - out.min()) / (out.max() - out.min())  # normalize to [0; 1]
                 else:
                     # Regretfully, the depthmap is broken and will be replaced with a black image
                     out = np.zeros(raw_prediction.shape)
-            out = (out - out.min()) / (out.max() - out.min())  # normalize to [0; 1]
 
-            # Single channel, 16 bit image. This loses some precision!
-            # uint16 conversion uses round-down, therefore values should be [0; 2**16)
-            numbytes = 2
-            max_val = (2 ** (8 * numbytes))
-            out = np.clip(out * max_val, 0, max_val - 0.1)  # Clipping form above is needed to avoid overflowing
-            img_output = out.astype("uint16")
+            img_output = convert_to_i16(out)
             """Depthmap (near=bright), as uint16"""
 
             # if 3dinpainting, store maps for processing in second pass
@@ -198,8 +213,8 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
 
             # A weird quirk: if user tries to save depthmap, whereas input depthmap is used,
             # depthmap will be outputed, even if output_depth_combine is used.
-            if inp[go.DO_OUTPUT_DEPTH] and inputdepthmaps[count] is None:
-                if inp[go.DO_OUTPUT_DEPTH]:
+            if inp[go.DO_OUTPUT_DEPTH]:
+                if inputdepthmaps[count] is None:
                     img_depth = cv2.bitwise_not(img_output) if inp[go.OUTPUT_DEPTH_INVERT] else img_output
                     if inp[go.OUTPUT_DEPTH_COMBINE]:
                         axis = 1 if inp[go.OUTPUT_DEPTH_COMBINE_AXIS] == 'Horizontal' else 0
@@ -209,6 +224,11 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
                         yield count, 'concat_depth', img_concat
                     else:
                         yield count, 'depth', Image.fromarray(img_depth)
+                else:
+                    # Yes, this seems stupid, but this is, logically, what should happen -
+                    # and this improves clarity of some other code.
+                    yield count, 'depth', Image.fromarray(img_output)
+
 
             if inp[go.GEN_STEREO]:
                 print("Generating stereoscopic images..")
@@ -318,7 +338,6 @@ def core_generation_funnel(outpath, inputimages, inputdepthmaps, inputnames, inp
 
 
 def get_uniquefn(outpath, basename, ext):
-    # Inefficient and may fail, maybe use unbounded binary search?
     basecount = backbone.get_next_sequence_number(outpath, basename)
     if basecount > 0: basecount = basecount - 1
     fullfn = None
